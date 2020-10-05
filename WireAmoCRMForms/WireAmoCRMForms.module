@@ -1,0 +1,684 @@
+<?php
+/**
+ *
+ * This module extends the WireMail base class and integrate the EmailMessage- and the SMTP-Library
+ * from M. Lemos (http://www.phpclasses.org/browse/author/1.html) into ProcessWire.
+ *
+ *
+ * @copyright Copyright (c) 2014 - 2020, Horst Nogajski
+ * @license http://www.gnu.org/licenses/gpl-2.0.txt GNU General Public License, version 2
+ * OR
+ * @license https://processwire.com/about/license/mit/
+ *
+ * ProcessWire 2.x & 3.x, Copyright 2020 by Ryan Cramer
+ * https://processwire.com
+ * https://processwire.com/about/license/mit/
+ * 
+ * 
+ * 
+ * Описание методов быстрой авторизации
+ * https://www.amocrm.ru/developers/content/oauth/step-by-step#easy_auth
+ * 
+ * /api/v4/leads
+ *
+**/
+// require_once('vendor/autoload.php');
+
+// use AmoCRM\Exceptions\AmoCRMApiException;
+// use AmoCRM\Models\AccountModel;
+// use League\OAuth2\Client\Token\AccessTokenInterface;
+// use AmoCRM\Client\AmoCRMApiClient;
+// use Symfony\Component\Dotenv\Dotenv;
+// use League\OAuth2\Client\Token\AccessToken;
+
+
+
+
+
+
+
+class WireAmoCRMForms extends WireData implements Module, ConfigurableModule {
+
+    private $settings;
+
+    public static function getModuleInfo() {
+        return array(
+            'title'     => 'Wire AmoCRM Forms',
+            'version'   => '0.0.1',
+            'summary'   => "Module for sending forms",
+            'href'      => 'https://unilead.studio',
+            'author'    => 'enimal',
+            'singular'  => true,
+            'autoload'  => true,
+            'icon' => 'smile-o'
+            );
+    }
+
+    public function init() {
+        // Получение конфига
+        $this->settings["subdomain"] = $this->get('settingSubdomain');
+        $this->settings["user"] = $this->get('settingUser');
+        $this->settings["clientId"] = $this->get('clientId');
+        $this->settings["clientSecret"] = $this->get('clientSecret');
+        $this->settings["redirectUri"] = $this->get('redirectUri');
+        $this->settings["lastTokenChange"] = $this->get('lastTokenChange');
+        if($this->get('is_createNewToken') == 1 
+            && $this->get('clientSecretCode') != "" 
+            && $this->get('clientId') != "" 
+            && $this->get('clientSecret') != "" 
+            && $this->get('redirectUri') != ""){
+            self::createNewSettings($this->get('clientSecretCode'));
+        } else {
+            self::refreshSettings();
+        }
+        $this->settings["accessToken"] = $this->get('accessToken');
+        $this->settings["refreshToken"] = $this->get('refreshToken');
+        $this->settimgs["accessData"] = self::getToken();
+    }
+
+    private function createNewSettings() {
+        $data = wire("modules")->getConfig($this->className());
+        $newData = self::getFirstAccessToken($data['clientSecretCode']);
+        $data['lastTokenChange'] = time() + 86400;
+        $data['accessToken'] = $newData["access_token"];
+        $data['refreshToken'] = $newData["refresh_token"];
+        $data['is_refreshToken'] = 0;
+        $data['is_createNewToken'] = 0;
+        $data['clientSecretCode'] = "";
+        wire("modules")->saveConfig($this->className(),$data);
+                
+    }
+
+    private function refreshSettings() {
+        $data = wire("modules")->getConfig($this->className());
+        if($data['lastTokenChange'] < time() || $data['is_refreshToken'] == 1) {
+            $newData = self::refreshAccessToken();
+            $data['lastTokenChange'] = time() + 86400;
+            $data['accessToken'] = $newData["access_token"];
+            $data['refreshToken'] = $newData["refresh_token"];
+            $data['is_refreshToken'] = 0;
+            $data['is_createNewToken'] = 0;
+            wire("modules")->saveConfig($this->className(),$data);
+        }
+                
+    }
+
+    private function getToken()
+    {
+        if (!file_exists(__DIR__ . "/access_token.json")) {
+            exit('Access token file not found');
+        }
+
+        $accessToken = json_decode(file_get_contents(__DIR__ . "/access_token.json"), true);
+
+        if (
+            isset($accessToken)
+            && isset($accessToken['access_token'])
+            && isset($accessToken['refresh_token'])
+            && isset($accessToken['expires_in'])
+            && isset($accessToken['token_type'])
+        ) {
+
+            return $accessToken;
+        } else {
+            exit('Invalid access token! ' . var_export($accessToken, true));
+        }
+    }
+
+    private function saveToken($accessToken)
+    {
+        // if (!file_exists(__DIR__ . "/access_token.json")) {
+        //     exit('Access token file not found');
+        // }
+
+        // $accessToken = json_decode(file_get_contents(__DIR__ . "/access_token.json"), true);
+
+        if (
+            isset($accessToken)
+            && isset($accessToken['access_token'])
+            && isset($accessToken['refresh_token'])
+            && isset($accessToken['expires_in'])
+            && isset($accessToken['token_type'])
+        ) {
+            file_put_contents(__DIR__ . "/access_token.json",json_encode($accessToken));
+            return true;
+        } else {
+            exit('Invalid access token! ' . var_export($accessToken, true));
+        }
+    }
+
+    private function refreshAccessToken(){
+        
+        $subdomain = $this->settings["subdomain"]; //Поддомен нужного аккаунта
+        $link = 'https://' . $subdomain . '.amocrm.ru/oauth2/access_token'; //Формируем URL для запроса
+        if (!file_exists(__DIR__ . "/access_token.json")) {
+            exit('Access token file not found');
+        }
+
+        $accessToken = json_decode(file_get_contents(__DIR__ . "/access_token.json"), true);
+        /** Соберем данные для запроса */
+        $data = [
+            'client_id' => $this->settings["clientId"],
+            'client_secret' => $this->settings["clientSecret"],
+            'grant_type' => 'refresh_token',
+            'refresh_token' => $accessToken['refresh_token'],
+            'redirect_uri' => $this->settings["redirectUri"],
+        ];
+
+        wire("log")->save("amo","F-REFRESH-TOKEN:" . print_r($data,true));
+        /**
+         * Нам необходимо инициировать запрос к серверу.
+         * Воспользуемся библиотекой cURL (поставляется в составе PHP).
+         * Вы также можете использовать и кроссплатформенную программу cURL, если вы не программируете на PHP.
+         */
+        $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
+        /** Устанавливаем необходимые опции для сеанса cURL  */
+        curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
+        curl_setopt($curl,CURLOPT_URL, $link);
+        curl_setopt($curl,CURLOPT_HTTPHEADER,['Content-Type:application/json']);
+        curl_setopt($curl,CURLOPT_HEADER, false);
+        curl_setopt($curl,CURLOPT_CUSTOMREQUEST, 'POST');
+        curl_setopt($curl,CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
+        $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
+        $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+        /** Теперь мы можем обработать ответ, полученный от сервера. Это пример. Вы можете обработать данные своим способом. */
+        $code = (int)$code;
+        $errors = [
+            400 => 'Bad request',
+            401 => 'Unauthorized',
+            403 => 'Forbidden',
+            404 => 'Not found',
+            500 => 'Internal server error',
+            502 => 'Bad gateway',
+            503 => 'Service unavailable',
+        ];
+        wire("log")->save("amo","REFRESH-TOKEN:" . $out);
+        try
+        {
+            /** Если код ответа не успешный - возвращаем сообщение об ошибке  */
+            if ($code < 200 || $code > 204) {
+                throw new Exception(isset($errors[$code]) ? $errors[$code] : 'Undefined error', $code);
+            }
+        }
+        catch(\Exception $e)
+        {
+            wire("log")->save("amo","REFRESH-TOKEN:" . '3Ошибка: ' . $e->getMessage() . PHP_EOL . 'Код ошибки: ' . $e->getCode() . 'Тело ответа: ' . $out);
+            die();
+        }
+
+        /**
+         * Данные получаем в формате JSON, поэтому, для получения читаемых данных,
+         * нам придётся перевести ответ в формат, понятный PHP
+         */
+        
+        $response = json_decode($out, true);
+        
+        if (
+            isset($response)
+            && isset($response['access_token'])
+            && isset($response['refresh_token'])
+            && isset($response['expires_in'])
+            && isset($response['token_type'])
+        ) {
+            file_put_contents(__DIR__ . "/access_token.json",json_encode($response));
+            return $response;
+        } else {
+            exit('Invalid access token! ' . var_export($accessToken, true));
+        }
+        // $access_token = $response['access_token']; //Access токен
+        // $refresh_token = $response['refresh_token']; //Refresh токен
+        // $token_type = $response['token_type']; //Тип токена
+        // $expires_in = $response['expires_in']; //Через сколько действие токена истекает
+    }
+
+    public function getFirstAccessToken($code) {
+        $subdomain = $this->settings["subdomain"];
+        $link = 'https://' . $subdomain . '.amocrm.ru/oauth2/access_token'; //Формируем URL для запроса
+
+        /** Соберем данные для запроса */
+        $data = [
+            'client_id' => $this->settings["clientId"],
+            'client_secret' =>  $this->settings["clientSecret"],
+            'grant_type' => 'authorization_code',
+            'code' => $code,
+            'redirect_uri' => $this->settings["redirectUri"],
+        ];
+
+        /**
+         * Нам необходимо инициировать запрос к серверу.
+         * Воспользуемся библиотекой cURL (поставляется в составе PHP).
+         * Вы также можете использовать и кроссплатформенную программу cURL, если вы не программируете на PHP.
+         */
+        $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
+        /** Устанавливаем необходимые опции для сеанса cURL  */
+        curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
+        curl_setopt($curl,CURLOPT_URL, $link);
+        curl_setopt($curl,CURLOPT_HTTPHEADER,['Content-Type:application/json']);
+        curl_setopt($curl,CURLOPT_HEADER, false);
+        curl_setopt($curl,CURLOPT_CUSTOMREQUEST, 'POST');
+        curl_setopt($curl,CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
+        $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
+        $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+        /** Теперь мы можем обработать ответ, полученный от сервера. Это пример. Вы можете обработать данные своим способом. */
+        $code = (int)$code;
+        $errors = [
+            400 => 'Bad request',
+            401 => 'Unauthorized',
+            403 => 'Forbidden',
+            404 => 'Not found',
+            500 => 'Internal server error',
+            502 => 'Bad gateway',
+            503 => 'Service unavailable',
+        ];
+        wire("log")->save("amo","NEW ACCESS-TOKEN:" . $out);
+        try
+        {
+            /** Если код ответа не успешный - возвращаем сообщение об ошибке  */
+            if ($code < 200 || $code > 204) {
+                throw new Exception(isset($errors[$code]) ? $errors[$code] : 'Undefined error', $code);
+            }
+        }
+        catch(\Exception $e)
+        {
+            wire("log")->save("amo","NEW ACCESS-TOKEN:" . '3Ошибка: ' . $e->getMessage() . PHP_EOL . 'Код ошибки: ' . $e->getCode() . 'Тело ответа: ' . $out);
+            die();
+        }
+
+        /**
+         * Данные получаем в формате JSON, поэтому, для получения читаемых данных,
+         * нам придётся перевести ответ в формат, понятный PHP
+         */
+        $response = json_decode($out, true);
+        file_put_contents(__DIR__ . "/access_token.json",json_encode($response));
+        return $response;
+        // $access_token = $response['access_token']; //Access токен
+        // $refresh_token = $response['refresh_token']; //Refresh токен
+        // $token_type = $response['token_type']; //Тип токена
+        // $expires_in = $response['expires_in']; //Через сколько действие токена истекает
+    }
+
+    // public function getLeadsList() {
+    //     return self::requestGet('GET', '/api/v4/leads');
+    // }
+
+    public function createNewLead($dataFileds = false) {
+        /*
+        "custom_fields_values": [
+    {
+        "field_id": 3,
+        "values": [
+            {
+                "value": "Значение поля"
+            }
+        ]
+    },
+    */
+
+        $lead = new StdClass;
+        $lead->source_name = "Заявка с сайта";
+        $lead->source_uid = md5(time());
+            $metadata = new StdClass;
+            $metadata->form_id = 1;
+            $metadata->form_name = "Заявка с сайта";
+            $metadata->form_page = $dataFileds["page"];
+            $metadata->ip = $dataFileds["ip"];
+            $metadata->form_sent_at = time();
+            $metadata->referer = "direct";
+        $lead->metadata = $metadata;
+            
+        //     $_eCustomfield = new StdClass;
+        //     // $_eCustomfield->field_code = "LEAD_MESSAGE"; //607701
+        //     $_eCustomfield->field_id = 608453; //607701
+        //         $_val = new StdClass;
+        //         $_val->value = $dataFileds["message"];
+        //     $_eCustomfield->values = [$_val];
+        // $lead->custom_fields_values[] = $_eCustomfield;
+        
+        $_embedded = new StdClass;
+
+            $_eLeads = new StdClass;
+            $_eLeads->name = $dataFileds["name"];
+            $_eLeads->visitor_uid = md5(time());
+        
+        $_embedded->leads[] = $_eLeads;
+            
+            $_eLeads = new StdClass;
+                $_eCustomfield = new StdClass;
+                $_eCustomfield->field_code = "LEAD_MESSAGE"; //608453
+                // $_eCustomfield->field_id = 608453; //608453
+                    $_val = new StdClass;
+                    $_val->value = $dataFileds["message"];
+                $_eCustomfield->values = [$_val];
+            $_eLeads->custom_fields_values[] = $_eCustomfield;
+        
+        $_embedded->leads[] = $_eLeads;
+
+        $_embedded->leads = [$_eLeads];
+            $_eContacts = new StdClass;
+            $_eContacts->name = $dataFileds["first_name"];
+            $_eContacts->first_name = $dataFileds["first_name"];
+            $_eContacts->last_name = $dataFileds["last_name"];
+            $_eContacts->visitor_uid = $dataFileds["visitor_uid"]; // ПРобуем добавить UID клиента
+                $_eCustomfield = new StdClass;
+                $_eCustomfield->field_code = "PHONE";
+                    $_val = new StdClass;
+                    $_val->value = $dataFileds["phone"];
+                $_eCustomfield->values = [$_val];
+            $_eContacts->custom_fields_values[] = $_eCustomfield;
+                
+                $_eCustomfield = new StdClass;
+                $_eCustomfield->field_code = "EMAIL";
+                    $_val = new StdClass;
+                    $_val->value = $dataFileds["email"];
+                $_eCustomfield->values = [$_val];
+            $_eContacts->custom_fields_values[] = $_eCustomfield;
+
+                $_eCustomfield = new StdClass;
+                $_eCustomfield->field_code = "USER_AGREEMENT"; //607701
+                    $_val = new StdClass;
+                    $_val->value = (isset($dataFileds["agreement"])) ? $dataFileds["agreement"] : true;
+                $_eCustomfield->values = [$_val];
+            $_eContacts->custom_fields_values[] = $_eCustomfield;
+
+        $_embedded->contacts = [$_eContacts];
+            $_eCompanies = new StdClass;
+            $_eCompanies->name = $dataFileds["companyName"];
+        $_embedded->companies = [$_eCompanies];
+
+        $lead->_embedded = $_embedded;
+
+        $data = [
+            $lead
+        ];
+        wire("log")->save("amo",json_encode($data));
+        return self::requestPost("/api/v4/leads/unsorted/forms", $data);
+
+    }
+
+    public function getCustomFields() 
+    {
+        $path = "/api/v4/contacts/custom_fields";
+        return self::requestGet($path);
+    }
+    
+
+    public function addNewFiled() 
+    {
+        $field = new StdClass;
+        $field->name = "LeadMessage";
+        $field->type = "textarea";
+        $field->code = "LEAD_MESSAGE";
+
+        $data = [
+            $field
+        ];
+        return self::requestPost("/api/v4/leads/custom_fields", $data);
+    }
+
+    public function deleteNewFiled() 
+    {
+        return self::requestDelete("/api/v4/leads/custom_fields/607701");
+    }
+
+    public function editNewFiled() 
+    {
+        $field = new StdClass;
+        $field->id = 607695;
+        // $field->code = "MESSAGE";
+
+        $data = [
+            $field
+        ];
+        return self::requestPatch("/api/v4/leads/custom_fields", $data);
+        // return self::requestDelete("/api/v4/leads/custom_fields/607699");
+    }
+
+    private function requestPost($path, $data = []) {
+        
+        $accessToken = self::getToken();
+
+        $subdomain = $this->settings["subdomain"]; //Поддомен нужного аккаунта
+        $link = 'https://' . $subdomain . '.amocrm.ru' . $path; //Формируем URL для запроса
+        /** Получаем access_token из вашего хранилища */
+        // $access_token = $accessToken['access_token'];
+        $access_token = $this->settings["accessToken"];
+        /** Формируем заголовки */
+        $headers = [
+            'Authorization: Bearer ' . $access_token,
+            'Content-Type:application/json'
+        ];
+        wire("log")->save("amo","PRE-POST REQUEST:" . 'OUT: ' .  print_r($data,true));
+        /**
+         * Нам необходимо инициировать запрос к серверу.
+         * Воспользуемся библиотекой cURL (поставляется в составе PHP).
+         * Вы также можете использовать и кроссплатформенную программу cURL, если вы не программируете на PHP.
+         */
+        $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
+        /** Устанавливаем необходимые опции для сеанса cURL  */
+        curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
+        curl_setopt($curl,CURLOPT_URL, $link);
+        curl_setopt($curl,CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl,CURLOPT_HEADER, false);
+        curl_setopt($curl,CURLOPT_CUSTOMREQUEST, 'POST');
+        curl_setopt($curl,CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
+        $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
+        $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+        /** Теперь мы можем обработать ответ, полученный от сервера. Это пример. Вы можете обработать данные своим способом. */
+        wire("log")->save("amo","POST RECIVED: " . $out);
+        $code = (int)$code;
+        $errors = [
+            400 => 'Bad request',
+            401 => 'Unauthorized',
+            403 => 'Forbidden',
+            404 => 'Not found',
+            500 => 'Internal server error',
+            502 => 'Bad gateway',
+            503 => 'Service unavailable',
+        ];
+        
+        try
+        {
+            /** Если код ответа не успешный - возвращаем сообщение об ошибке  */
+            if ($code < 200 || $code > 204) {
+                throw new Exception(isset($errors[$code]) ? $errors[$code] : 'Undefined error', $code);
+            }
+        }
+        catch(\Exception $e)
+        {
+            wire("log")->save("amo","POST REQUEST:" . '3Ошибка: ' . $e->getMessage() . PHP_EOL . 'Код ошибки: ' . $e->getCode() . 'Тело ответа: ' . $out);
+        }
+        return $out;
+
+    }
+    
+    private function requestPatch($path, $data = []) {
+        
+        $accessToken = self::getToken();
+
+        $subdomain = $this->settings["subdomain"]; //Поддомен нужного аккаунта
+        $link = 'https://' . $subdomain . '.amocrm.ru' . $path; //Формируем URL для запроса
+        /** Получаем access_token из вашего хранилища */
+        // $access_token = $accessToken['access_token'];
+        $access_token = $this->settings["accessToken"];
+        /** Формируем заголовки */
+        $headers = [
+            'Authorization: Bearer ' . $access_token,
+            'Content-Type:application/json'
+        ];
+        /**
+         * Нам необходимо инициировать запрос к серверу.
+         * Воспользуемся библиотекой cURL (поставляется в составе PHP).
+         * Вы также можете использовать и кроссплатформенную программу cURL, если вы не программируете на PHP.
+         */
+        $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
+        /** Устанавливаем необходимые опции для сеанса cURL  */
+        curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
+        curl_setopt($curl,CURLOPT_URL, $link);
+        curl_setopt($curl,CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl,CURLOPT_HEADER, false);
+        curl_setopt($curl,CURLOPT_CUSTOMREQUEST, 'PATCH');
+        curl_setopt($curl,CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
+        $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
+        $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+        /** Теперь мы можем обработать ответ, полученный от сервера. Это пример. Вы можете обработать данные своим способом. */
+        $code = (int)$code;
+        $errors = [
+            400 => 'Bad request',
+            401 => 'Unauthorized',
+            403 => 'Forbidden',
+            404 => 'Not found',
+            500 => 'Internal server error',
+            502 => 'Bad gateway',
+            503 => 'Service unavailable',
+        ];
+        
+        try
+        {
+            /** Если код ответа не успешный - возвращаем сообщение об ошибке  */
+            if ($code < 200 || $code > 204) {
+                throw new Exception(isset($errors[$code]) ? $errors[$code] : 'Undefined error', $code);
+            }
+        }
+        catch(\Exception $e)
+        {
+            wire("log")->save("amo","POST REQUEST:" . '3Ошибка: ' . $e->getMessage() . PHP_EOL . 'Код ошибки: ' . $e->getCode() . 'Тело ответа: ' . $out);
+        }
+        return $out;
+
+    }
+
+    private function requestGet($path) {
+        
+        $accessToken = self::getToken();
+
+        $subdomain = $this->settings["subdomain"]; //Поддомен нужного аккаунта
+        $link = 'https://' . $subdomain . '.amocrm.ru' . $path; //Формируем URL для запроса
+        /** Получаем access_token из вашего хранилища */
+        // $access_token = $accessToken['access_token'];
+        $access_token = $this->settings["accessToken"];
+        /** Формируем заголовки */
+        $headers = [
+            'Authorization: Bearer ' . $access_token,
+            'Content-Type:application/json'
+        ];
+        /**
+         * Нам необходимо инициировать запрос к серверу.
+         * Воспользуемся библиотекой cURL (поставляется в составе PHP).
+         * Вы также можете использовать и кроссплатформенную программу cURL, если вы не программируете на PHP.
+         */
+        $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
+        /** Устанавливаем необходимые опции для сеанса cURL  */
+        curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
+        curl_setopt($curl,CURLOPT_URL, $link);
+        curl_setopt($curl,CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl,CURLOPT_HEADER, false);
+        curl_setopt($curl,CURLOPT_CUSTOMREQUEST, 'GET');
+        curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
+        $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
+        $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+        /** Теперь мы можем обработать ответ, полученный от сервера. Это пример. Вы можете обработать данные своим способом. */
+        $code = (int)$code;
+        $errors = [
+            400 => 'Bad request',
+            401 => 'Unauthorized',
+            403 => 'Forbidden',
+            404 => 'Not found',
+            500 => 'Internal server error',
+            502 => 'Bad gateway',
+            503 => 'Service unavailable',
+        ];
+        
+        try
+        {
+            /** Если код ответа не успешный - возвращаем сообщение об ошибке  */
+            if ($code < 200 || $code > 204) {
+                throw new Exception(isset($errors[$code]) ? $errors[$code] : 'Undefined error', $code);
+            }
+        }
+        catch(\Exception $e)
+        {
+            wire("log")->save("amo","POST REQUEST:" . '3Ошибка: ' . $e->getMessage() . PHP_EOL . 'Код ошибки: ' . $e->getCode() . 'Тело ответа: ' . $out);
+        }
+        return $out;
+
+    }
+
+    private function requestDelete($path) {
+        
+        $accessToken = self::getToken();
+
+        $subdomain = $this->settings["subdomain"]; //Поддомен нужного аккаунта
+        $link = 'https://' . $subdomain . '.amocrm.ru' . $path; //Формируем URL для запроса
+        /** Получаем access_token из вашего хранилища */
+        // $access_token = $accessToken['access_token'];
+        $access_token = $this->settings["accessToken"];
+        /** Формируем заголовки */
+        $headers = [
+            'Authorization: Bearer ' . $access_token,
+            'Content-Type:application/json'
+        ];
+        /**
+         * Нам необходимо инициировать запрос к серверу.
+         * Воспользуемся библиотекой cURL (поставляется в составе PHP).
+         * Вы также можете использовать и кроссплатформенную программу cURL, если вы не программируете на PHP.
+         */
+        $curl = curl_init(); //Сохраняем дескриптор сеанса cURL
+        /** Устанавливаем необходимые опции для сеанса cURL  */
+        curl_setopt($curl,CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl,CURLOPT_USERAGENT,'amoCRM-oAuth-client/1.0');
+        curl_setopt($curl,CURLOPT_URL, $link);
+        curl_setopt($curl,CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($curl,CURLOPT_HEADER, false);
+        curl_setopt($curl,CURLOPT_CUSTOMREQUEST, 'DELETE');
+        curl_setopt($curl,CURLOPT_SSL_VERIFYPEER, 1);
+        curl_setopt($curl,CURLOPT_SSL_VERIFYHOST, 2);
+        $out = curl_exec($curl); //Инициируем запрос к API и сохраняем ответ в переменную
+        $code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
+        curl_close($curl);
+        /** Теперь мы можем обработать ответ, полученный от сервера. Это пример. Вы можете обработать данные своим способом. */
+        $code = (int)$code;
+        $errors = [
+            400 => 'Bad request',
+            401 => 'Unauthorized',
+            403 => 'Forbidden',
+            404 => 'Not found',
+            500 => 'Internal server error',
+            502 => 'Bad gateway',
+            503 => 'Service unavailable',
+        ];
+        
+        try
+        {
+            /** Если код ответа не успешный - возвращаем сообщение об ошибке  */
+            if ($code < 200 || $code > 204) {
+                throw new Exception(isset($errors[$code]) ? $errors[$code] : 'Undefined error', $code);
+            }
+        }
+        catch(\Exception $e)
+        {
+            wire("log")->save("amo","POST REQUEST:" . '3Ошибка: ' . $e->getMessage() . PHP_EOL . 'Код ошибки: ' . $e->getCode() . 'Тело ответа: ' . $out);
+        }
+        return $out;
+
+    }
+
+}
